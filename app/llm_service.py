@@ -1,13 +1,18 @@
 """
-LLM Service: Converts natural language questions to Cypher queries
-using Azure OpenAI (gpt-4o-mini) and executes them against Neo4j.
+LLM Service: Converts natural language questions to Cypher queries using
+Azure OpenAI (gpt-4o-mini), executes them against Neo4j, and summarises the
+results back into a conversational, natural-language answer.
 """
 
-import httpx
+import re
 import json
 import logging
 
-from app.config import LLM_BASE_URL, LLM_API_KEY, LLM_SUBSCRIPTION_KEY, LLM_MODEL, LLM_API_VERSION
+import httpx
+
+from app.config import (
+    LLM_BASE_URL, LLM_API_KEY, LLM_SUBSCRIPTION_KEY, LLM_MODEL, LLM_API_VERSION,
+)
 from app.db import db
 
 logger = logging.getLogger(__name__)
@@ -37,16 +42,17 @@ SYSTEM_PROMPT = """You are a Neo4j Cypher query expert. You translate natural la
 **Key Concepts:**
 - A "Node" represents a hardware/software component (circuit, function module, interface, pin, etc.)
 - "NodeType" defines what kind of component it is (resultingCircuit, functionModule, function, interfaceVariant, pin, resourceRequirement, connectionNet, etc.)
-- "Assignment" holds actual data values for a node. "libraryValue" is the system default, "value" is user-modified.
+- "Assignment" holds actual data values for a node. "libraryValue" is the system default, "value" is the user-modified override (empty string means not modified).
 - "Attribute" defines the field (name, displayName) and links to both a NodeType and a Widget.
 
 ## Rules:
-1. ONLY generate READ queries (MATCH, RETURN, WITH, WHERE, ORDER BY, LIMIT). NEVER generate CREATE, DELETE, SET, MERGE, or REMOVE.
-2. Always use LIMIT unless the user explicitly asks for all results. Default LIMIT 25.
-3. Return meaningful property values, not just node references.
-4. When searching by name, use case-insensitive matching: toLower(n.name) CONTAINS toLower('search_term')
-5. Return ONLY the Cypher query, no explanations or markdown formatting.
-6. If the question cannot be answered with the schema, return: // CANNOT_ANSWER: <reason>
+1. ONLY generate READ queries (MATCH, OPTIONAL MATCH, RETURN, WITH, WHERE, ORDER BY, LIMIT, UNWIND over collected lists). NEVER generate CREATE, DELETE, SET, MERGE, REMOVE, DROP, LOAD CSV, or CALL {} IN TRANSACTIONS.
+2. Always use LIMIT unless the user explicitly asks for all results or a count. Default LIMIT 25.
+3. Return meaningful property values (names, labels, values), not raw node references.
+4. When matching by name, use case-insensitive matching: toLower(n.name) CONTAINS toLower('search_term')
+5. A node is "user-modified" when its Assignment.value is not null and not the empty string.
+6. Return ONLY the Cypher query — no explanations, no markdown fences.
+7. If the question cannot be answered from this schema, return exactly: // CANNOT_ANSWER: <reason>
 
 ## Examples:
 
@@ -72,93 +78,147 @@ User: "Show the children of node BS_CY329-CAN"
 Cypher: MATCH (parent:Node {name: 'BS_CY329-CAN'})-[:HAS_CHILD]->(child:Node)-[:OF_TYPE]->(nt:NodeType) RETURN child.name, nt.label LIMIT 25
 """
 
+ANSWER_PROMPT = """You are a helpful data assistant for an engineering configuration tool.
+Given a user's question and the rows returned by a Neo4j query, write a short,
+friendly, natural-language answer (1-3 sentences).
 
-def generate_cypher(user_question: str) -> str:
-    """Call Azure OpenAI to convert natural language to Cypher."""
+Guidelines:
+- Lead with the direct answer (a count, a name, a yes/no).
+- Mention notable specifics from the rows when useful, but do NOT dump the whole table — it is shown separately.
+- If there are no rows, say so plainly and, if helpful, suggest a refinement.
+- Never invent data that is not in the rows. Be concise."""
+
+# Write/DDL clauses we must never run. Matched as whole words so a node named
+# "CREATE_X" or a property value won't trigger a false positive.
+WRITE_KEYWORDS = [
+    "CREATE", "DELETE", "SET", "MERGE", "REMOVE", "DROP",
+    "DETACH", "FOREACH", "LOAD CSV", "CALL DBMS",
+]
+_WRITE_RE = re.compile(
+    r"\b(" + "|".join(k.replace(" ", r"\s+") for k in WRITE_KEYWORDS) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_string_literals(cypher: str) -> str:
+    """Remove quoted string contents so the safety check ignores literals."""
+    no_single = re.sub(r"'(?:[^'\\]|\\.)*'", "''", cypher)
+    return re.sub(r'"(?:[^"\\]|\\.)*"', '""', no_single)
+
+
+def _is_write_query(cypher: str) -> bool:
+    return bool(_WRITE_RE.search(_strip_string_literals(cypher)))
+
+
+def _call_llm(messages: list[dict], max_tokens: int = 500, temperature: float = 0.0) -> str:
     url = f"{LLM_BASE_URL}/chat/completions?api-version={LLM_API_VERSION}"
-
     headers = {
         "Content-Type": "application/json",
         "api-key": LLM_API_KEY,
         "Ocp-Apim-Subscription-Key": LLM_SUBSCRIPTION_KEY,
     }
-
     payload = {
         "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_question},
-        ],
-        "temperature": 0.0,
-        "max_tokens": 500,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
     }
-
     with httpx.Client(timeout=30.0) as client:
         response = client.post(url, json=payload, headers=headers)
         response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"].strip()
 
-    result = response.json()
-    cypher = result["choices"][0]["message"]["content"].strip()
 
-    # Clean up potential markdown formatting
+def generate_cypher(user_question: str) -> str:
+    """Call Azure OpenAI to convert a natural language question to Cypher."""
+    cypher = _call_llm(
+        [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_question},
+        ],
+        max_tokens=500,
+    )
+
+    # Strip markdown fences if the model wrapped the query.
     if cypher.startswith("```"):
-        lines = cypher.split("\n")
-        cypher = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
+        cypher = re.sub(r"^```[a-zA-Z]*\n?", "", cypher)
+        cypher = re.sub(r"\n?```$", "", cypher).strip()
 
     logger.info(f"Generated Cypher: {cypher}")
     return cypher
 
 
+def summarize_results(user_question: str, data: list[dict]) -> str:
+    """Turn query rows into a conversational answer via a second LLM call."""
+    # Cap the payload so we don't blow the context window on large results.
+    preview = data[:30]
+    rows_json = json.dumps(preview, default=str, ensure_ascii=False)
+    context = (
+        f"Question: {user_question}\n"
+        f"Total rows returned: {len(data)}\n"
+        f"Rows (first {len(preview)} shown): {rows_json}"
+    )
+    return _call_llm(
+        [
+            {"role": "system", "content": ANSWER_PROMPT},
+            {"role": "user", "content": context},
+        ],
+        max_tokens=250,
+        temperature=0.2,
+    )
+
+
+def _fallback_answer(data: list[dict]) -> str:
+    if not data:
+        return "I couldn't find any results for that question."
+    if len(data) == 1:
+        return "I found 1 result."
+    return f"I found {len(data)} results."
+
+
 def chat(user_question: str) -> dict:
     """
     Full chat pipeline:
-    1. Convert question to Cypher
-    2. Execute against Neo4j
-    3. Return results
+      1. Convert the question to Cypher.
+      2. Guard against write operations.
+      3. Execute against Neo4j.
+      4. Summarise the rows into a conversational answer.
     """
     try:
         cypher = generate_cypher(user_question)
 
         if cypher.startswith("// CANNOT_ANSWER"):
             return {
-                "answer": cypher.replace("// CANNOT_ANSWER:", "").strip(),
+                "answer": cypher.replace("// CANNOT_ANSWER:", "").strip()
+                or "I can't answer that with the available data.",
                 "cypher": None,
                 "data": [],
                 "error": None,
             }
 
-        # Safety check: reject write operations
-        dangerous_keywords = ["CREATE", "DELETE", "SET ", "MERGE", "REMOVE", "DROP", "DETACH"]
-        cypher_upper = cypher.upper()
-        for kw in dangerous_keywords:
-            if kw in cypher_upper:
-                return {
-                    "answer": "I can only execute read queries. The generated query contained write operations.",
-                    "cypher": cypher,
-                    "data": [],
-                    "error": "Write operation blocked",
-                }
+        if _is_write_query(cypher):
+            return {
+                "answer": "I can only run read-only queries, and the generated query "
+                          "contained a write operation, so I didn't execute it.",
+                "cypher": cypher,
+                "data": [],
+                "error": "Write operation blocked",
+            }
 
         results = db.execute_read(cypher)
 
-        if not results:
-            answer = "No results found for your query."
-        elif len(results) == 1:
-            answer = f"Found 1 result."
-        else:
-            answer = f"Found {len(results)} results."
+        try:
+            answer = summarize_results(user_question, results)
+        except Exception as e:  # summarisation is best-effort
+            logger.warning(f"Answer summarisation failed, using fallback: {e}")
+            answer = _fallback_answer(results)
 
-        return {
-            "answer": answer,
-            "cypher": cypher,
-            "data": results,
-            "error": None,
-        }
+        return {"answer": answer, "cypher": cypher, "data": results, "error": None}
 
     except httpx.HTTPStatusError as e:
         logger.error(f"LLM API error: {e}")
         return {
-            "answer": "Failed to connect to the LLM service.",
+            "answer": "I couldn't reach the language model service. Please try again.",
             "cypher": None,
             "data": [],
             "error": str(e),
@@ -166,7 +226,7 @@ def chat(user_question: str) -> dict:
     except Exception as e:
         logger.error(f"Chat error: {e}")
         return {
-            "answer": f"An error occurred: {str(e)}",
+            "answer": f"Something went wrong while answering: {e}",
             "cypher": None,
             "data": [],
             "error": str(e),

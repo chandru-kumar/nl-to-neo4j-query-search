@@ -1,5 +1,5 @@
 """
-Data loader: Reads JSON files and populates Neo4j graph database.
+Data loader: Reads JSON files and populates the Neo4j graph database.
 
 Graph Model:
   (:Project) -[:HAS_NODE]-> (:Node) -[:HAS_CHILD]-> (:Node)
@@ -8,11 +8,19 @@ Graph Model:
   (:Attribute) -[:USES_WIDGET]-> (:Widget)
   (:Attribute) -[:BELONGS_TO_TYPE]-> (:NodeType)
   (:NodeType) -[:CHILD_TYPE_OF]-> (:NodeType)
+
+Performance:
+  The project node trees can contain hundreds to thousands of nodes each,
+  every one carrying multiple assignments. To avoid one network round-trip
+  per node/assignment/relationship (which made loading take hours), the
+  tree is flattened in memory and written with batched UNWIND queries.
 """
 
 import json
 import os
+import glob
 import logging
+from typing import Any
 
 from app.db import db
 
@@ -21,18 +29,71 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# Rows written per UNWIND batch. Large enough to amortise round-trips,
+# small enough to keep each transaction's memory bounded.
+CHUNK_SIZE = 5000
 
-def load_json(filename: str):
-    filepath = os.path.join(DATA_DIR, filename)
-    logger.info(f"Loading {filepath}...")
+
+# ── Extended-JSON helpers ───────────────────────────────────────────────
+# MongoDB exports wrap values as {"$oid": "..."} or {"$numberLong": "..."}.
+# Depending on the export, a reference id may appear either as a bare string
+# or wrapped. These helpers accept BOTH forms so links resolve regardless.
+
+def extract_oid(value: Any) -> str:
+    """Return an ObjectId string from a bare string or {"$oid": ...} form."""
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return str(value.get("$oid", value.get("$numberLong", ""))) or ""
+    return str(value)
+
+
+def extract_scalar(value: Any) -> str:
+    """Return a scalar (id/number) from a bare value or extended-JSON wrapper."""
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return str(value.get("$numberLong", value.get("$oid", value.get("$numberInt", ""))))
+    return str(value)
+
+
+def find_data_file(name: str) -> str:
+    """
+    Locate a source JSON file. The export numbers files inconsistently
+    (e.g. `Project-Paweb.Project.json` vs `Project-Paweb.Project-1.json`),
+    so match on a glob and take the first hit.
+    """
+    candidates = sorted(glob.glob(os.path.join(DATA_DIR, name)))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No data file matching '{name}' in {DATA_DIR}. "
+            "Place the exported JSON files in the project root."
+        )
+    return candidates[0]
+
+
+def load_json(name: str):
+    filepath = find_data_file(name)
+    logger.info(f"Loading {os.path.basename(filepath)}...")
     with open(filepath, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
+def write_chunked(query: str, rows: list[dict]):
+    """Run a batched UNWIND write in CHUNK_SIZE slices."""
+    for i in range(0, len(rows), CHUNK_SIZE):
+        db.execute_write_batch(query, rows[i:i + CHUNK_SIZE])
+
+
+# ── Schema setup ────────────────────────────────────────────────────────
+
 def clear_database():
-    """Remove all nodes and relationships."""
+    """Remove all nodes and relationships (in batches to avoid OOM)."""
     logger.info("Clearing existing data...")
-    db.execute_write("MATCH (n) DETACH DELETE n")
+    # CALL {} IN TRANSACTIONS keeps memory bounded on large graphs.
+    db.execute_write(
+        "MATCH (n) CALL { WITH n DETACH DELETE n } IN TRANSACTIONS OF 10000 ROWS"
+    )
 
 
 def create_constraints():
@@ -42,26 +103,31 @@ def create_constraints():
         "CREATE CONSTRAINT IF NOT EXISTS FOR (nt:NodeType) REQUIRE nt.uid IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (a:Attribute) REQUIRE a.uid IS UNIQUE",
         "CREATE CONSTRAINT IF NOT EXISTS FOR (p:Project) REQUIRE p.uid IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Node) REQUIRE n.nodeKey IS UNIQUE",
+        "CREATE CONSTRAINT IF NOT EXISTS FOR (a:Assignment) REQUIRE a.assignKey IS UNIQUE",
         "CREATE INDEX IF NOT EXISTS FOR (n:Node) ON (n.nodeId)",
         "CREATE INDEX IF NOT EXISTS FOR (n:Node) ON (n.name)",
+        "CREATE INDEX IF NOT EXISTS FOR (nt:NodeType) ON (nt.name)",
+        "CREATE INDEX IF NOT EXISTS FOR (a:Attribute) ON (a.name)",
     ]
     for c in constraints:
         db.execute_write(c)
     logger.info("Constraints and indexes created.")
 
 
-def load_widgets():
-    """Load Widget nodes."""
-    data = load_json("Project-Paweb.Widget.json")
-    batch = []
-    for w in data:
-        batch.append({
-            "uid": w["_id"]["$oid"],
-            "type": w["type"],
-            "description": w.get("description", ""),
-        })
+# ── Reference data (Widget / NodeType / Attribute) ──────────────────────
 
-    db.execute_write_batch(
+def load_widgets():
+    data = load_json("Project-Paweb.Widget*.json")
+    batch = [
+        {
+            "uid": extract_oid(w["_id"]),
+            "type": w.get("type", ""),
+            "description": w.get("description", ""),
+        }
+        for w in data
+    ]
+    write_chunked(
         """
         UNWIND $batch AS row
         MERGE (w:Widget {uid: row.uid})
@@ -73,25 +139,20 @@ def load_widgets():
 
 
 def load_node_types():
-    """Load NodeType nodes and parent relationships."""
-    data = load_json("Project-Paweb.NodeType.json")
-    batch = []
-    parent_links = []
+    data = load_json("Project-Paweb.NodeType*.json")
+    batch, parent_links = [], []
     for nt in data:
-        uid = nt["_id"]["$oid"]
+        uid = extract_oid(nt["_id"])
         batch.append({
             "uid": uid,
-            "name": nt["name"],
-            "label": nt.get("label", nt["name"]),
+            "name": nt.get("name", ""),
+            "label": nt.get("label", nt.get("name", "")),
             "handler": nt.get("handler", ""),
         })
-        if "parentId" in nt:
-            parent_links.append({
-                "child_uid": uid,
-                "parent_uid": nt["parentId"]["$oid"],
-            })
+        if nt.get("parentId"):
+            parent_links.append({"child_uid": uid, "parent_uid": extract_oid(nt["parentId"])})
 
-    db.execute_write_batch(
+    write_chunked(
         """
         UNWIND $batch AS row
         MERGE (nt:NodeType {uid: row.uid})
@@ -99,9 +160,8 @@ def load_node_types():
         """,
         batch,
     )
-
     if parent_links:
-        db.execute_write_batch(
+        write_chunked(
             """
             UNWIND $batch AS row
             MATCH (child:NodeType {uid: row.child_uid})
@@ -114,22 +174,24 @@ def load_node_types():
 
 
 def load_attributes():
-    """Load Attribute nodes with relationships to Widget and NodeType."""
-    data = load_json("Project-Paweb.Attribute.json")
+    data = load_json("Project-Paweb.Attribute*.json")
     batch = []
     for attr in data:
+        sort = 0
+        if "sort" in attr:
+            sort = int(extract_scalar(attr["sort"]) or 0)
         batch.append({
-            "uid": attr["_id"]["$oid"],
-            "name": attr["name"],
-            "displayName": attr.get("displayName", attr["name"]),
+            "uid": extract_oid(attr["_id"]),
+            "name": attr.get("name", ""),
+            "displayName": attr.get("displayName", attr.get("name", "")),
             "directName": attr.get("directName", ""),
             "showAttributeName": attr.get("showAttributeName", False),
-            "widgetId": attr["widgetId"]["$oid"] if "widgetId" in attr else None,
-            "nodeTypeId": attr["nodeTypeId"]["$oid"] if "nodeTypeId" in attr else None,
-            "sort": int(attr["sort"]["$numberLong"]) if "sort" in attr else 0,
+            "widgetId": extract_oid(attr.get("widgetId")),
+            "nodeTypeId": extract_oid(attr.get("nodeTypeId")),
+            "sort": sort,
         })
 
-    db.execute_write_batch(
+    write_chunked(
         """
         UNWIND $batch AS row
         MERGE (a:Attribute {uid: row.uid})
@@ -142,10 +204,9 @@ def load_attributes():
         batch,
     )
 
-    # Link Attribute -> Widget
     widget_links = [r for r in batch if r["widgetId"]]
     if widget_links:
-        db.execute_write_batch(
+        write_chunked(
             """
             UNWIND $batch AS row
             MATCH (a:Attribute {uid: row.uid})
@@ -155,10 +216,9 @@ def load_attributes():
             widget_links,
         )
 
-    # Link Attribute -> NodeType
     type_links = [r for r in batch if r["nodeTypeId"]]
     if type_links:
-        db.execute_write_batch(
+        write_chunked(
             """
             UNWIND $batch AS row
             MATCH (a:Attribute {uid: row.uid})
@@ -168,155 +228,181 @@ def load_attributes():
             type_links,
         )
 
-    logger.info(f"Loaded {len(batch)} attributes.")
+    logger.info(
+        f"Loaded {len(batch)} attributes "
+        f"({len(widget_links)} widget links, {len(type_links)} type links)."
+    )
+
+
+# ── Projects & node trees ───────────────────────────────────────────────
+
+def _flatten_node_tree(project_uid, parent_key, nodes, acc):
+    """
+    Walk the recursive node tree and append plain rows to `acc` buckets so
+    they can be written with batched UNWIND queries afterwards.
+    """
+    for node in nodes:
+        node_id = extract_scalar(node.get("id"))
+        node_key = f"{project_uid}_{node_id}"
+
+        acc["nodes"].append({
+            "nodeKey": node_key,
+            "nodeId": node_id,
+            "name": node.get("name", ""),
+            "directId": extract_scalar(node.get("directId")),
+            "containerId": extract_scalar(node.get("containerId")),
+            "hasWarning": node.get("hasWarning", False),
+        })
+
+        nt_id = extract_oid(node.get("nodeTypeId"))
+        if nt_id:
+            acc["type_links"].append({"nodeKey": node_key, "ntUid": nt_id})
+
+        if parent_key is None:
+            acc["root_links"].append({"projUid": project_uid, "nodeKey": node_key})
+        else:
+            acc["child_links"].append({"parentKey": parent_key, "childKey": node_key})
+
+        for i, assign in enumerate(node.get("assignments", []) or []):
+            assign_key = f"{node_key}_assign_{i}"
+            acc["assignments"].append({
+                "assignKey": assign_key,
+                "nodeKey": node_key,
+                "libValue": _stringify(assign.get("libraryValue")),
+                "userValue": _stringify(assign.get("value")),
+            })
+            attr_id = extract_oid(assign.get("attributeId"))
+            if attr_id:
+                acc["attr_links"].append({"assignKey": assign_key, "attrUid": attr_id})
+
+        children = node.get("children", []) or []
+        if children:
+            _flatten_node_tree(project_uid, node_key, children, acc)
+
+
+def _stringify(value: Any) -> str:
+    """Normalise an assignment value to a string for storage/search."""
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return extract_scalar(value)
+    if isinstance(value, (list, tuple)):
+        return ", ".join(_stringify(v) for v in value)
+    return str(value)
+
+
+def _flush_project(acc):
+    """Write one project's accumulated rows to Neo4j with batched queries."""
+    write_chunked(
+        """
+        UNWIND $batch AS row
+        MERGE (n:Node {nodeKey: row.nodeKey})
+        SET n.nodeId = row.nodeId,
+            n.name = row.name,
+            n.directId = row.directId,
+            n.containerId = row.containerId,
+            n.hasWarning = row.hasWarning
+        """,
+        acc["nodes"],
+    )
+    write_chunked(
+        """
+        UNWIND $batch AS row
+        MATCH (n:Node {nodeKey: row.nodeKey})
+        MATCH (nt:NodeType {uid: row.ntUid})
+        MERGE (n)-[:OF_TYPE]->(nt)
+        """,
+        acc["type_links"],
+    )
+    write_chunked(
+        """
+        UNWIND $batch AS row
+        MATCH (p:Project {uid: row.projUid})
+        MATCH (n:Node {nodeKey: row.nodeKey})
+        MERGE (p)-[:HAS_NODE]->(n)
+        """,
+        acc["root_links"],
+    )
+    write_chunked(
+        """
+        UNWIND $batch AS row
+        MATCH (parent:Node {nodeKey: row.parentKey})
+        MATCH (child:Node {nodeKey: row.childKey})
+        MERGE (parent)-[:HAS_CHILD]->(child)
+        """,
+        acc["child_links"],
+    )
+    write_chunked(
+        """
+        UNWIND $batch AS row
+        MATCH (n:Node {nodeKey: row.nodeKey})
+        MERGE (a:Assignment {assignKey: row.assignKey})
+        SET a.libraryValue = row.libValue, a.value = row.userValue
+        MERGE (n)-[:HAS_ASSIGNMENT]->(a)
+        """,
+        acc["assignments"],
+    )
+    write_chunked(
+        """
+        UNWIND $batch AS row
+        MATCH (a:Assignment {assignKey: row.assignKey})
+        MATCH (attr:Attribute {uid: row.attrUid})
+        MERGE (a)-[:FOR_ATTRIBUTE]->(attr)
+        """,
+        acc["attr_links"],
+    )
 
 
 def load_projects():
-    """Load Project nodes and their hierarchical node trees."""
-    data = load_json("Project-Paweb.Project.json")
+    """Load Project nodes and their hierarchical node trees (batched)."""
+    data = load_json("Project-Paweb.Project*.json")
     logger.info(f"Processing {len(data)} projects...")
 
+    proj_rows = []
     for idx, proj in enumerate(data):
-        proj_uid = proj["_id"]["$oid"]
-        proj_name = proj.get("name", f"Project_{idx}")
+        version = proj.get("projectVersion", {}) or {}
+        proj_rows.append({
+            "uid": extract_oid(proj["_id"]),
+            "name": proj.get("name", f"Project_{idx}"),
+            "ecuFamily": proj.get("ecuFamilyName", ""),
+            "version": extract_scalar(version.get("version", 0)),
+            "status": version.get("status", ""),
+        })
+    write_chunked(
+        """
+        UNWIND $batch AS row
+        MERGE (p:Project {uid: row.uid})
+        SET p.name = row.name,
+            p.ecuFamilyName = row.ecuFamily,
+            p.version = row.version,
+            p.status = row.status
+        """,
+        proj_rows,
+    )
 
-        # Create Project node
-        db.execute_write(
-            """
-            MERGE (p:Project {uid: $uid})
-            SET p.name = $name,
-                p.ecuFamilyName = $ecuFamily,
-                p.version = $version,
-                p.status = $status
-            """,
-            {
-                "uid": proj_uid,
-                "name": proj_name,
-                "ecuFamily": proj.get("ecuFamilyName", ""),
-                "version": proj.get("projectVersion", {}).get("version", 0),
-                "status": proj.get("projectVersion", {}).get("status", ""),
-            },
-        )
+    total_nodes = total_assignments = 0
+    for idx, proj in enumerate(data):
+        proj_uid = extract_oid(proj["_id"])
+        acc = {
+            "nodes": [], "type_links": [], "root_links": [],
+            "child_links": [], "assignments": [], "attr_links": [],
+        }
+        # The tree is under "node" in this export.
+        _flatten_node_tree(proj_uid, None, proj.get("node", []) or [], acc)
+        _flush_project(acc)
 
-        # Process node tree
-        nodes = proj.get("node", [])
-        if nodes:
-            _load_node_tree(proj_uid, None, nodes)
-
-        if (idx + 1) % 20 == 0:
-            logger.info(f"  Processed {idx + 1}/{len(data)} projects...")
-
-    logger.info(f"Loaded {len(data)} projects.")
-
-
-def _load_node_tree(project_uid: str, parent_node_key: str | None, nodes: list):
-    """Recursively load node tree into Neo4j."""
-    for node in nodes:
-        node_id = str(node["id"].get("$numberLong", node["id"])) if isinstance(node["id"], dict) else str(node["id"])
-        node_name = node.get("name", "")
-        node_type_id = node.get("nodeTypeId", "")
-        direct_id = ""
-        if "directId" in node:
-            direct_id = str(node["directId"].get("$numberLong", node["directId"])) if isinstance(node["directId"], dict) else str(node["directId"])
-        container_id = ""
-        if "containerId" in node:
-            container_id = str(node["containerId"].get("$numberLong", node["containerId"])) if isinstance(node["containerId"], dict) else str(node["containerId"])
-        has_warning = node.get("hasWarning", False)
-
-        # Unique key: project_uid + node_id (node ids are unique within a project)
-        node_key = f"{project_uid}_{node_id}"
-
-        # Create Node
-        db.execute_write(
-            """
-            MERGE (n:Node {nodeKey: $nodeKey})
-            SET n.nodeId = $nodeId,
-                n.name = $name,
-                n.directId = $directId,
-                n.containerId = $containerId,
-                n.hasWarning = $hasWarning
-            """,
-            {
-                "nodeKey": node_key,
-                "nodeId": node_id,
-                "name": node_name,
-                "directId": direct_id,
-                "containerId": container_id,
-                "hasWarning": has_warning,
-            },
-        )
-
-        # Link Node -> NodeType
-        if node_type_id:
-            db.execute_write(
-                """
-                MATCH (n:Node {nodeKey: $nodeKey})
-                MATCH (nt:NodeType {uid: $ntUid})
-                MERGE (n)-[:OF_TYPE]->(nt)
-                """,
-                {"nodeKey": node_key, "ntUid": node_type_id},
+        total_nodes += len(acc["nodes"])
+        total_assignments += len(acc["assignments"])
+        if (idx + 1) % 20 == 0 or (idx + 1) == len(data):
+            logger.info(
+                f"  Processed {idx + 1}/{len(data)} projects "
+                f"({total_nodes} nodes, {total_assignments} assignments so far)..."
             )
 
-        # Link to Project or Parent
-        if parent_node_key is None:
-            db.execute_write(
-                """
-                MATCH (p:Project {uid: $projUid})
-                MATCH (n:Node {nodeKey: $nodeKey})
-                MERGE (p)-[:HAS_NODE]->(n)
-                """,
-                {"projUid": project_uid, "nodeKey": node_key},
-            )
-        else:
-            db.execute_write(
-                """
-                MATCH (parent:Node {nodeKey: $parentKey})
-                MATCH (child:Node {nodeKey: $childKey})
-                MERGE (parent)-[:HAS_CHILD]->(child)
-                """,
-                {"parentKey": parent_node_key, "childKey": node_key},
-            )
-
-        # Process assignments
-        assignments = node.get("assignments", [])
-        for i, assign in enumerate(assignments):
-            attr_id = assign.get("attributeId", "")
-            lib_value = assign.get("libraryValue", "")
-            user_value = assign.get("value", "")
-            assign_key = f"{node_key}_assign_{i}"
-
-            db.execute_write(
-                """
-                MERGE (a:Assignment {assignKey: $assignKey})
-                SET a.libraryValue = $libValue,
-                    a.value = $userValue
-                WITH a
-                MATCH (n:Node {nodeKey: $nodeKey})
-                MERGE (n)-[:HAS_ASSIGNMENT]->(a)
-                """,
-                {
-                    "assignKey": assign_key,
-                    "nodeKey": node_key,
-                    "libValue": lib_value,
-                    "userValue": user_value,
-                },
-            )
-
-            # Link Assignment -> Attribute
-            if attr_id:
-                db.execute_write(
-                    """
-                    MATCH (a:Assignment {assignKey: $assignKey})
-                    MATCH (attr:Attribute {uid: $attrUid})
-                    MERGE (a)-[:FOR_ATTRIBUTE]->(attr)
-                    """,
-                    {"assignKey": assign_key, "attrUid": attr_id},
-                )
-
-        # Recurse into children
-        children = node.get("children", [])
-        if children:
-            _load_node_tree(project_uid, node_key, children)
+    logger.info(
+        f"Loaded {len(data)} projects, {total_nodes} nodes, "
+        f"{total_assignments} assignments."
+    )
 
 
 def run_loader():

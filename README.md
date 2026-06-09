@@ -1,6 +1,13 @@
 # PA Web Chatbot
 
-A natural-language chatbot that lets users query a **Neo4j Graph Database** using plain English. The application translates user questions into Cypher queries via **Azure OpenAI (GPT-4o-mini)**, executes them against the graph, and returns structured results.
+A natural-language chatbot that lets users query a **Neo4j Graph Database** using plain English. The application translates user questions into Cypher queries via **Azure OpenAI (GPT-4o-mini)**, executes them against the graph, and returns a **conversational answer** alongside the generated Cypher and a result table.
+
+> **Recent improvements**
+> - **Batched data loading** — the project node trees are flattened and written with `UNWIND` batches instead of one round-trip per node/assignment, turning multi-hour loads into minutes.
+> - **Robust ID parsing** — reference ids (`nodeTypeId`, `attributeId`, …) are read whether they arrive as bare strings or MongoDB `{"$oid": …}` wrappers, so relationships always link.
+> - **Conversational answers** — results are summarised back into a friendly natural-language reply, not just "Found N results".
+> - **Safer query guard** — write operations are rejected with whole-word matching that ignores string literals (no false positives on data named `CREATE_…`).
+> - **Polished assistant UI** — welcome screen with suggested prompts, streamed replies, live backend-status indicator, and collapsible Cypher/results.
 
 ## Tech Stack
 
