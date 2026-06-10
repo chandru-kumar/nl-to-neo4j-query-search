@@ -88,9 +88,10 @@ def load_data():
     from app.data_loader import run_loader
     try:
         db.close()
-        run_loader()
+        summary = run_loader()
         db.connect()
-        return {"status": "Data loaded successfully"}
+        counts = ", ".join(f"{v} {k}" for k, v in (summary or {}).items())
+        return {"status": f"Data loaded successfully ({counts})", "counts": summary}
     except Exception as e:
         db.connect()
         raise HTTPException(status_code=500, detail=str(e))

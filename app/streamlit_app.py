@@ -13,7 +13,10 @@ import requests
 import pandas as pd
 import streamlit as st
 
-DEFAULT_API_URL = "http://localhost:8000"
+# Use 127.0.0.1 (not "localhost"): on Windows "localhost" resolves to IPv6
+# ::1 first, but uvicorn --host 0.0.0.0 binds IPv4 only, causing connection
+# errors / 404s from a different listener. 127.0.0.1 forces IPv4.
+DEFAULT_API_URL = "http://127.0.0.1:8000"
 
 st.set_page_config(
     page_title="PA-Web Assistant",
@@ -79,9 +82,18 @@ with st.sidebar:
             try:
                 resp = requests.post(f"{api_url}/load-data", timeout=1800)
                 if resp.status_code == 200:
-                    st.success("Data loaded successfully!")
+                    try:
+                        msg = resp.json().get("status", "Data loaded successfully!")
+                    except ValueError:
+                        msg = "Data loaded successfully!"
+                    st.success(msg)
                 else:
-                    st.error(resp.json().get("detail", "Unknown error"))
+                    # Surface the real error even when the body isn't JSON.
+                    try:
+                        detail = resp.json().get("detail", resp.text)
+                    except ValueError:
+                        detail = resp.text or f"HTTP {resp.status_code} (empty response)"
+                    st.error(f"Load failed ({resp.status_code}): {detail}")
             except requests.RequestException as e:
                 st.error(f"Connection error: {e}")
 

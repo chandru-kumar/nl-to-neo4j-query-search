@@ -409,8 +409,24 @@ def load_projects():
     )
 
 
+def _summary_counts() -> dict:
+    """Count the loaded graph for a load confirmation message."""
+    rows = db.execute_read(
+        """
+        RETURN
+          count{ (p:Project) }    AS projects,
+          count{ (n:Node) }       AS nodes,
+          count{ (nt:NodeType) }  AS nodeTypes,
+          count{ (a:Attribute) }  AS attributes,
+          count{ (w:Widget) }     AS widgets,
+          count{ (asg:Assignment) } AS assignments
+        """
+    )
+    return rows[0] if rows else {}
+
+
 def run_loader():
-    """Main entry point for data loading."""
+    """Main entry point for data loading. Returns a summary of counts."""
     db.connect()
     try:
         clear_database()
@@ -419,7 +435,9 @@ def run_loader():
         load_node_types()
         load_attributes()
         load_projects()
-        logger.info("Data loading complete!")
+        summary = _summary_counts()
+        logger.info(f"Data loading complete! {summary}")
+        return summary
     finally:
         db.close()
 
