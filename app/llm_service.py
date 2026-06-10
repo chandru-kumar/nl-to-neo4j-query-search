@@ -119,7 +119,7 @@ def _call_llm(messages: list[dict], max_tokens: int = 500, temperature: float = 
     headers = {
         "Content-Type": "application/json",
         "api-key": LLM_API_KEY,
-        "Ocp-Apim-Subscription-Key": LLM_SUBSCRIPTION_KEY,
+        "genaiplatform-farm-subscription-key": LLM_SUBSCRIPTION_KEY,
     }
     payload = {
         "model": LLM_MODEL,
