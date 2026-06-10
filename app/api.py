@@ -14,8 +14,13 @@ from app.config import API_HOST, API_PORT
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup/shutdown lifecycle."""
-    db.connect()
+    """Startup/shutdown lifecycle.
+
+    We attempt to connect but never crash the app if Neo4j isn't ready yet
+    (e.g. the container is still booting). The driver retries lazily on the
+    first query, and /health reports the live status.
+    """
+    db.connect(verify=True)
     yield
     db.close()
 
@@ -49,7 +54,12 @@ class ChatResponse(BaseModel):
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    """Report API status and whether Neo4j is currently reachable."""
+    neo4j_ok = db.is_healthy()
+    return {
+        "status": "ok",
+        "neo4j": "connected" if neo4j_ok else "unavailable",
+    }
 
 
 @app.post("/chat", response_model=ChatResponse)
