@@ -188,6 +188,7 @@ def load_attributes():
             "showAttributeName": attr.get("showAttributeName", False),
             "widgetId": extract_oid(attr.get("widgetId")),
             "nodeTypeId": extract_oid(attr.get("nodeTypeId")),
+            "enumerant": attr.get("enumerant", []),
             "sort": sort,
         })
 
@@ -199,6 +200,7 @@ def load_attributes():
             a.displayName = row.displayName,
             a.directName = row.directName,
             a.showAttributeName = row.showAttributeName,
+            a.enumerant = row.enumerant,
             a.sort = row.sort
         """,
         batch,
@@ -264,7 +266,9 @@ def _flatten_node_tree(project_uid, parent_key, nodes, acc):
             acc["child_links"].append({"parentKey": parent_key, "childKey": node_key})
 
         for i, assign in enumerate(node.get("assignments", []) or []):
-            assign_key = f"{node_key}_assign_{i}"
+            # Prefer the assignment's own stable id; fall back to its position.
+            assign_id = extract_scalar(assign.get("id"))
+            assign_key = f"{node_key}_{assign_id}" if assign_id else f"{node_key}_assign_{i}"
             acc["assignments"].append({
                 "assignKey": assign_key,
                 "nodeKey": node_key,
