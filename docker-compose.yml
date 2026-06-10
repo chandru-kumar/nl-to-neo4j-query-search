@@ -2,12 +2,28 @@ services:
   neo4j:
     image: neo4j:latest
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "7474:7474"   # Neo4j Browser (HTTP UI)
+      - "7687:7687"   # Bolt protocol (used by the Python driver)
+    # Use Docker-managed named volumes instead of host bind mounts.
+    # On Windows/macOS the Neo4j entrypoint tries to `chown` mounted folders,
+    # which fails on host bind mounts ("Operation not permitted") and sends the
+    # container into a restart loop. Named volumes have correct permissions and
+    # still persist data across restarts.
     volumes:
-      - ./data:/data
-      - ./logs:/logs
-      - ./plugins:/plugins
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_plugins:/plugins
     environment:
       - NEO4J_AUTH=neo4j/password123
-    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_plugins:
